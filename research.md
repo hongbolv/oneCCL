@@ -6,6 +6,7 @@
 - [2. 整体架构设计](#2-整体架构设计)
 - [3. 目录结构与模块划分](#3-目录结构与模块划分)
 - [4. 核心数据结构](#4-核心数据结构)
+  - [4.6 Rank 详解](#46-rank-详解)
 - [5. 初始化与生命周期管理](#5-初始化与生命周期管理)
 - [6. 传输层抽象（ATL）](#6-传输层抽象atl)
 - [7. 集合通信操作](#7-集合通信操作)
@@ -268,6 +269,196 @@ struct ccl_coll_param {
 - 管理 rank 编号和映射关系
 - 支持通信器拆分（`comm_split`）
 - 维护拓扑感知的子通信器（pair_comm、even_comm、node_comm、r2r_comm）
+
+### 4.6 Rank 详解
+
+#### 4.6.1 什么是 Rank
+
+在分布式计算中，**rank** 是分配给每个参与进程的唯一整数标识符，范围从 `0` 到 `size - 1`（其中 `size` 是通信器中的进程总数）。可以把 rank 理解为"进程编号"——在一个由多台机器（或多个 GPU）组成的分布式系统中，每个参与计算的进程都有一个独一无二的 rank。
+
+**类比**：如果把分布式训练比作一个团队协作项目，每个团队成员（进程）都有一个工号（rank）。成员之间通过工号来标识"我要把数据发给谁"或"我从谁那里接收数据"。
+
+#### 4.6.2 Rank 在 oneCCL 中的数据结构
+
+**进程坐标结构**（文件：`src/atl/atl_def.h`）：
+
+```cpp
+typedef struct atl_proc_coord {
+    int global_idx;           // 全局 rank 索引（在整个系统中的编号）
+    int global_count;         // 全局进程总数
+    int local_idx;            // 本地 rank 索引（在同一台机器上的编号）
+    int local_count;          // 同一台机器上的进程数
+    std::vector<int> global2local_map;  // 全局 rank → 本地索引映射
+    size_t hostname_hash;     // 主机标识哈希值
+} atl_proc_coord_t;
+```
+
+**通信器中的 rank 管理**（文件：`src/atl/atl_base_comm.hpp`）：
+
+```cpp
+class atl_base_comm {
+protected:
+    int rank;                          // 当前进程在此通信器中的 rank
+    int size;                          // 通信器中的进程总数
+    int parent_rank;                   // 在父通信器中的 rank（用于通信器拆分）
+    int parent_size;                   // 父通信器大小
+
+    std::vector<int> rank2rank_map;    // 本通信器 rank → 父通信器 rank 映射
+    std::vector<int> rank2proc_map;    // 本通信器 rank → 物理进程索引映射
+    atl_proc_coord_t coord;            // 进程坐标信息
+};
+```
+
+**拓扑感知的 rank 信息**（文件：`src/topology/topo_manager.hpp`）：
+
+```cpp
+struct topo_rank_info {
+    int rank;               // 全局 rank
+    int host_idx;           // 所在主机索引
+    int local_proc_idx;     // 主机上的本地进程索引
+    char uuid[35];          // GPU 设备 UUID（用于 GPU rank）
+};
+```
+
+#### 4.6.3 Rank 的多层语义
+
+在 oneCCL 中，同一个物理进程可以在不同的上下文中拥有不同的 rank 值：
+
+| 术语 | 含义 | 使用场景 |
+|------|------|----------|
+| **rank**（通信器内） | 进程在当前通信器中的编号（0 到 size-1） | 集合操作中标识参与者 |
+| **global_idx** | 进程在全局系统中的绝对编号 | 系统级进程追踪 |
+| **local_idx** | 进程在同一台主机上的编号 | 节点内通信优化 |
+| **parent_rank** | 进程在父通信器中的编号 | 通信器拆分后保持映射关系 |
+
+**示意图：通信器拆分后的 rank 变化**
+
+```
+全局通信器（4个进程，2台机器）:
+┌──────────────────────────────────────────┐
+│  rank=0      rank=1     rank=2    rank=3 │
+│ (机器A)     (机器A)    (机器B)   (机器B)  │
+└──────────────────────────────────────────┘
+            │ comm_split（按机器拆分）
+            ▼
+节点内通信器 (机器A):        节点内通信器 (机器B):
+┌───────────────────┐     ┌───────────────────┐
+│ rank=0    rank=1  │     │ rank=0    rank=1  │
+│(全局0)   (全局1)  │     │(全局2)   (全局3)  │
+└───────────────────┘     └───────────────────┘
+
+注意：拆分后同一个进程在不同通信器中有不同的 rank
+     例如全局 rank=2 的进程，在机器B的节点内通信器中 rank=0
+```
+
+#### 4.6.4 Rank 在集合操作中的作用
+
+rank 决定了每个进程在集合操作中的角色和数据归属：
+
+**1. Allreduce 中的 rank**
+```
+所有 rank 贡献自己的数据，规约后所有 rank 得到相同的结果
+
+rank 0: [1, 2, 3]  ─┐
+rank 1: [4, 5, 6]  ─┤── allreduce(sum) ──→ 所有 rank 得到 [10, 14, 18]
+rank 2: [5, 7, 9]  ─┘
+```
+
+**2. Broadcast 中的 rank**
+```
+root rank 的数据广播给所有其他 rank
+
+rank 0 (root): [A, B, C]  ──broadcast──→  rank 0: [A, B, C]
+rank 1:        [?, ?, ?]                   rank 1: [A, B, C]
+rank 2:        [?, ?, ?]                   rank 2: [A, B, C]
+```
+
+**3. Reduce-Scatter 中的 rank**
+```
+规约后，结果的不同部分分配给不同 rank
+
+rank 0: [1, 2, 3]  ─┐                     rank 0: [10]  (第0块的规约结果)
+rank 1: [4, 5, 6]  ─┤── reduce_scatter ──→ rank 1: [14]  (第1块的规约结果)
+rank 2: [5, 7, 9]  ─┘                     rank 2: [18]  (第2块的规约结果)
+```
+
+**4. Ring 算法中 rank 决定通信伙伴**
+```
+在 Ring Allreduce 中，rank 决定环形拓扑中的相邻关系：
+
+    rank 0 ──→ rank 1 ──→ rank 2 ──→ rank 3
+      ↑                                 │
+      └─────────────────────────────────┘
+
+每个 rank 只与相邻的 rank 通信：
+  rank i 发送给 (i+1) % size
+  rank i 接收来自 (i-1+size) % size
+```
+
+#### 4.6.5 用户代码中的 Rank 使用
+
+文件：`examples/cpu/cpu_allreduce_test.cpp`
+
+```cpp
+int main() {
+    ccl::init();
+
+    int size, rank;
+    MPI_Init(NULL, NULL);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);  // 获取总进程数
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);  // 获取当前进程的 rank
+
+    // 使用 rank 和 size 创建 CCL 通信器
+    auto comm = ccl::create_communicator(size, rank, kvs);
+
+    // 通过通信器查询 rank
+    rank = comm.rank();   // 获取 CCL rank
+    size = comm.size();   // 获取通信器大小
+
+    // 每个 rank 用自己的 rank 值初始化数据
+    std::vector<int> send_buf(count, rank);  // rank 0 填充 0, rank 1 填充 1, ...
+
+    // 所有 rank 参与 allreduce
+    ccl::allreduce(send_buf.data(), recv_buf.data(), count,
+                   ccl::reduction::sum, comm).wait();
+
+    // 通常由 rank 0 负责输出结果
+    if (rank == 0) {
+        std::cout << "结果验证通过" << std::endl;
+    }
+}
+```
+
+**运行方式**（启动 4 个 rank）：
+```bash
+mpirun -n 4 ./cpu_allreduce_test
+#   -n 4 表示启动 4 个进程，rank 分别为 0, 1, 2, 3
+```
+
+#### 4.6.6 GPU 场景下的 Rank
+
+在 GPU 场景中，每个 rank 通常关联一个 GPU 设备。rank 的拓扑信息用于优化通信路径：
+
+```
+节点 0 (2 GPU):
+├── rank 0 → GPU 0 (UUID: xxx-aaa)  ─┐
+│                                     ├─ XeLink 直连（节点内高速通信）
+├── rank 1 → GPU 1 (UUID: xxx-bbb)  ─┘
+│
+节点 1 (2 GPU):
+├── rank 2 → GPU 0 (UUID: yyy-aaa)  ─┐
+│                                     ├─ XeLink 直连
+└── rank 3 → GPU 1 (UUID: yyy-bbb)  ─┘
+
+节点间通信: rank 0 ←──网络（OFI/MPI）──→ rank 2
+```
+
+oneCCL 利用 rank 的拓扑信息构建分层通信器：
+- **pair_comm**：XeLink 直连的 GPU 对（如 rank 0 和 rank 1）
+- **node_comm**：同一节点内的所有 rank
+- **r2r_comm**：跨节点的对应 rank（如 rank 0 和 rank 2）
+
+这使得 topo 算法能够先在节点内利用 XeLink 高速通信，再通过网络进行节点间通信，最大化整体通信效率。
 
 ---
 
