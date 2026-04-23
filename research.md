@@ -1725,12 +1725,124 @@ vLLM DP=2, TP=2 配置（4 GPU）：
 
 TP 组内通信（同一 `ZE_AFFINITY_MASK` 内的 rank）正常工作，因为它们共享相同的设备可见性。但 DP 跨组通信需要跨越不同的 `ZE_AFFINITY_MASK` 边界，触发上述 IPC 问题。
 
-### 17.6 可能的解决方向
+### 17.6 解决方案
 
-1. **不设置 ZE_AFFINITY_MASK**：使用 `CUDA_VISIBLE_DEVICES` 或 `ONEAPI_DEVICE_SELECTOR` 的等效机制来实现设备隔离，而非 `ZE_AFFINITY_MASK`
-2. **oneCCL 改进**：在 IPC handle 交换时检测跨 affinity mask 场景，自动回退到非 IPC 路径（如通过 host 内存中转）
-3. **应用层规避**：确保属于同一通信组的所有 rank 使用相同的 `ZE_AFFINITY_MASK`
-4. **Level Zero 运行时改进**：支持跨 affinity mask 的 IPC handle 打开（需要驱动层面支持）
+根因在于：oneCCL 的 GPU IPC 路径（`zeMemOpenIpcHandle`）要求接收方进程的 Level Zero context 能访问发送方 IPC handle 对应的物理 GPU，而不同的 `ZE_AFFINITY_MASK` 破坏了这一前提。以下从**即时可用**到**长期改进**列出解决方案：
+
+#### 方案 1（推荐）：应用层 — 不使用 ZE_AFFINITY_MASK 做进程隔离
+
+**原理**：不设置 `ZE_AFFINITY_MASK`，让所有进程都能看到全部 GPU，然后通过 `torch.xpu.set_device(local_rank)` 在应用层控制每个 rank 绑定哪张 GPU。
+
+**vLLM 的改法**：在 vLLM 的 worker 启动逻辑中，不要为不同的 DP group 设置不同的 `ZE_AFFINITY_MASK`，改用 `local_rank` 映射：
+
+```python
+# 修改前（vLLM 当前行为 — 导致 hang）:
+# DP group 0: ZE_AFFINITY_MASK="0,1"  → rank 0,1 只看到 2 GPU
+# DP group 1: ZE_AFFINITY_MASK="2,3"  → rank 2,3 只看到 2 GPU
+
+# 修改后（推荐）:
+# 不设置 ZE_AFFINITY_MASK，或统一设置 ZE_AFFINITY_MASK="0,1,2,3"
+# 通过 local_rank 绑定设备：
+#   rank 0 → torch.xpu.set_device(0)
+#   rank 1 → torch.xpu.set_device(1)
+#   rank 2 → torch.xpu.set_device(2)
+#   rank 3 → torch.xpu.set_device(3)
+```
+
+**验证**：这正是测试脚本中模式 A（baseline）和模式 C（same_affinity）正常工作的原因。
+
+**优点**：零代码改动（oneCCL 侧），仅需修改应用层的设备分配逻辑。
+**缺点**：所有进程都能看到全部 GPU，内存隔离不如 `ZE_AFFINITY_MASK` 严格。
+
+#### 方案 2：应用层 — 使用 ONEAPI_DEVICE_SELECTOR 替代 ZE_AFFINITY_MASK
+
+**原理**：`ONEAPI_DEVICE_SELECTOR` 在 SYCL 运行时层过滤设备，但**不影响 Level Zero 的设备枚举**。oneCCL 内部直接使用 Level Zero API（`zeDeviceGet`），因此 `ONEAPI_DEVICE_SELECTOR` 不会影响 IPC handle 的 context 映射。
+
+```bash
+# 替代方案（如果应用层需要设备过滤）
+export ONEAPI_DEVICE_SELECTOR="level_zero:0,1"  # 只对 SYCL 层生效
+# oneCCL 内部的 zeDeviceGet 仍然能看到全部 GPU
+```
+
+**注意**：需要验证 oneCCL 是否在所有路径都通过 SYCL 还是直接调用 Level Zero。从源码看，`src/common/utils/sycl_utils.cpp` 第 31 行有 `ONEAPI_DEVICE_SELECTOR` 检查，但 IPC 路径直接使用 Level Zero API，因此此方案的有效性取决于具体驱动版本。
+
+#### 方案 3：oneCCL 配置 — 禁用 ZE IPC 路径强制走 host 内存
+
+**原理**：通过环境变量关闭 oneCCL 的 Level Zero GPU IPC 优化，强制使用 host 内存作为中转，绕过 `zeMemOpenIpcHandle` 的 context 限制。
+
+```bash
+# 方法 A：完全禁用 Level Zero 加速（回退到纯 host 路径）
+export CCL_ZE_ENABLE=0
+
+# 方法 B：禁用 IPC handle 缓存（不解决根因，但可排除缓存相关问题）
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES=0
+
+# 方法 C：切换 IPC 交换模式为 sockets（可能绕过部分 context 问题）
+export CCL_ZE_IPC_EXCHANGE=sockets
+```
+
+对应源码位置：
+- `CCL_ZE_ENABLE`：`src/common/env/env.cpp` 第 350 行，`ze_enable(1)` 默认开启
+- `CCL_ZE_IPC_EXCHANGE`：`src/common/env/env.cpp` 第 355 行，默认 `pidfd` 模式
+- `CCL_ZE_CACHE_OPEN_IPC_HANDLES`：`src/common/env/env.cpp` 第 330 行
+
+**优点**：不需要修改任何代码，纯环境变量配置。
+**缺点**：`CCL_ZE_ENABLE=0` 会禁用所有 GPU 直通优化，all_reduce 性能会**显著下降**（数据需经 GPU→Host→Host→GPU 两次拷贝）。
+
+#### 方案 4：oneCCL 代码改进 — IPC handle 交换时检测并回退
+
+**原理**：在 `ze_handle_exchange_entry.cpp` 的 `fill_payload` 阶段，增加对发送方和接收方 `ZE_AFFINITY_MASK` 的一致性检测。如果不一致，自动回退到 host 内存路径。
+
+**改动点**（`src/sched/entry/ze/ze_handle_exchange_entry.cpp`）：
+
+```cpp
+// 在 common_fd_mode_exchange() 或 create_local_ipc_handles() 中增加检测：
+void ze_handle_exchange_entry::validate_affinity_masks() {
+    // 1. 收集所有 rank 的 ZE_AFFINITY_MASK
+    char* local_mask = getenv("ZE_AFFINITY_MASK");
+    std::string mask_str = local_mask ? local_mask : "";
+    
+    // 2. 通过 allgather 交换 mask 信息
+    // 3. 如果存在不一致的 mask，设置标志禁用 IPC 路径
+    // 4. 回退到 host staging buffer 路径
+}
+```
+
+**改动点**（`src/sched/ze/ze_handle_manager.cpp` 第 302-318 行 `open_handle`）：
+
+```cpp
+void ipc_handle_manager::open_handle(ipc_handle_desc& info, void** ptr, bool to_cache) {
+    // 增加：检查 remote context 是否能访问目标设备
+    // 如果不能，回退到 host 内存中转
+    if (!can_access_remote_device(info)) {
+        // 通过 host staging buffer 复制数据
+        use_host_staging_path(info, ptr);
+        return;
+    }
+    // ... 原有 IPC 路径
+}
+```
+
+**优点**：对应用层完全透明，自动检测并处理。
+**缺点**：需要修改 oneCCL 核心代码，需要上游接受 patch。
+
+#### 方案 5：Level Zero 驱动层 — 支持跨 affinity mask 的 IPC
+
+**原理**：修改 Level Zero 驱动，使 `zeMemOpenIpcHandle` 能够在目标进程的 context 中映射任意物理 GPU 的内存，即使该 GPU 不在当前进程的 `ZE_AFFINITY_MASK` 中。
+
+**现状**：这需要 Intel GPU 驱动团队的支持，是长期解决方案。
+
+#### 方案对比总结
+
+| 方案 | 改动位置 | 性能影响 | 复杂度 | 推荐度 |
+|------|---------|---------|--------|--------|
+| 1. 不设 ZE_AFFINITY_MASK | 应用层（vLLM） | 无 | ⭐ | ⭐⭐⭐⭐⭐ |
+| 2. 用 ONEAPI_DEVICE_SELECTOR | 应用层 | 无 | ⭐⭐ | ⭐⭐⭐ |
+| 3. CCL_ZE_ENABLE=0 | 环境变量 | 严重下降 | ⭐ | ⭐⭐（仅调试） |
+| 4. oneCCL 自动回退 | oneCCL 代码 | 跨组通信下降 | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ |
+| 5. 驱动层修复 | Level Zero 驱动 | 无 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐（长期） |
+
+**立即可行的最佳方案**是方案 1：修改 vLLM 的 worker 启动逻辑，不为不同 DP group 设置不同的 `ZE_AFFINITY_MASK`，而是统一让所有进程看到全部 GPU，通过 `set_device()` 控制绑定。
 
 ---
 
