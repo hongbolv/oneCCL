@@ -1540,4 +1540,198 @@ oneCCL 最适合以下场景：
 
 ---
 
+## 17. 案例分析：跨 ZE_AFFINITY_MASK 的 IPC 通信 Hang 问题
+
+### 17.1 问题描述
+
+在 4 张 Intel B60 GPU 上运行 `test_xccl_cross_affinity.py` 测试脚本，三种模式的表现不同：
+
+| 模式 | ZE_AFFINITY_MASK 设置 | 结果 |
+|------|----------------------|------|
+| **A (baseline)** | 不设置（所有进程看到全部 4 GPU） | ✅ 正常 |
+| **B (cross_affinity)** | Rank 0,1 → "0,1"；Rank 2,3 → "2,3" | ❌ Hang |
+| **C (same_affinity)** | 所有进程 → "0,1,2,3" | ✅ 正常 |
+
+### 17.2 根因分析
+
+#### 17.2.1 ZE_AFFINITY_MASK 的作用机制
+
+`ZE_AFFINITY_MASK` 是 Level Zero 运行时的环境变量，在 `zeDeviceGet()` 阶段过滤可见设备。oneCCL 在初始化时调用此 API 获取设备列表：
+
+```cpp
+// src/common/global/ze/ze_data.cpp, 第 81-84 行
+uint32_t device_count{};
+ZE_CALL(zeDeviceGet, (drivers.at(i), &device_count, nullptr));
+std::vector<ze_device_handle_t> devs(device_count);
+ZE_CALL(zeDeviceGet, (drivers.at(i), &device_count, devs.data()));
+```
+
+设置不同 `ZE_AFFINITY_MASK` 后，各进程看到的设备列表不同：
+
+```
+模式 B 中的设备视图：
+┌─────────────────────────────────────────────────────────┐
+│ Rank 0,1 (ZE_AFFINITY_MASK="0,1")                      │
+│   zeDeviceGet → 返回 2 个设备                           │
+│   devices[0] = 物理 GPU 0                               │
+│   devices[1] = 物理 GPU 1                               │
+│   contexts[0] = 关联 GPU 0,1 的上下文                    │
+├─────────────────────────────────────────────────────────┤
+│ Rank 2,3 (ZE_AFFINITY_MASK="2,3")                      │
+│   zeDeviceGet → 返回 2 个设备                           │
+│   devices[0] = 物理 GPU 2（但本地索引为 0）              │
+│   devices[1] = 物理 GPU 3（但本地索引为 1）              │
+│   contexts[0] = 关联 GPU 2,3 的上下文                    │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### 17.2.2 IPC Handle 交换流程中的断裂点
+
+oneCCL 的 `all_reduce` 在 GPU 模式下通过 IPC（Inter-Process Communication）在进程间共享 GPU 内存。完整流程如下：
+
+**步骤 1：发送端创建 IPC Handle**
+
+```cpp
+// src/sched/entry/ze/ze_handle_exchange_entry.cpp, 第 130-137 行
+// Rank 0: 在自己的 context 上调用 zeMemGetIpcHandle
+mem_info = get_mem_info(mem_ptr);
+sched->get_memory().handle_manager.get_handle(
+    mem_info.first, &ipc_handle, &handle_id);
+```
+
+Rank 0 在 GPU 0 上分配内存并生成 IPC handle。
+
+**步骤 2：附加上下文和设备元数据**
+
+```cpp
+// src/sched/entry/ze/ze_handle_exchange_entry.cpp, 第 234-254 行
+ccl::ze::get_buffer_context_and_device(mem_ptr, &remote_context, &remote_device, &mem_alloc_props);
+ccl::ze::get_context_global_id(remote_context, &remote_context_id);
+ccl::ze::get_device_global_id(remote_device, &remote_device_id);
+payload.remote_context_id = remote_context_id;  // 例如: 0
+payload.remote_device_id = remote_device_id;    // 例如: 0
+```
+
+Rank 0 将 `remote_context_id=0`（自己的 context）和 `remote_device_id=0`（物理 GPU 0，本地索引 0）写入 payload。
+
+**步骤 3：通过 allgather 交换 payload**
+
+```cpp
+// src/sched/entry/ze/ze_handle_exchange_entry.cpp, 第 309-324 行
+ccl::utils::allgather(comm->get_atl_comm(),
+                      local_payloads.data(),
+                      all_payloads.data(),
+                      sizeof(payload_t) * in_buffers.size());
+```
+
+所有 rank 交换各自的 IPC payload（包含 handle、context_id、device_id 等）。
+
+**步骤 4：接收端打开 IPC Handle（❌ 断裂点）**
+
+```cpp
+// src/sched/entry/ze/cache/ze_cache.cpp, 第 430-435 行
+auto remote_context_id = std::get<...>(key);
+auto remote_context = global_data::get().ze_data->contexts.at(remote_context_id);
+ze_ipc_mem_handle_t handle = info.mem_to_ipc_handle();
+ZE_CALL(zeMemOpenIpcHandle, (remote_context, device, handle, {}, &ptr));
+```
+
+当 Rank 2 尝试打开 Rank 0 的 IPC handle 时：
+- `remote_context_id=0`：Rank 0 中指向 GPU 0,1 的上下文
+- 但在 Rank 2 进程中，`contexts[0]` 指向 **GPU 2,3** 的上下文（因为 `ZE_AFFINITY_MASK="2,3"`）
+- **上下文不匹配**：Rank 2 用一个关联 GPU 2,3 的上下文去打开一个在 GPU 0 上创建的 IPC handle
+
+#### 17.2.3 Hang 的直接原因
+
+```
+Rank 0 创建 IPC handle                Rank 2 尝试打开 IPC handle
+┌──────────────────────┐              ┌──────────────────────┐
+│ context → GPU 0,1    │              │ context → GPU 2,3    │
+│ device  → GPU 0      │              │ device  → GPU 2      │
+│ 内存在 GPU 0 上      │──── IPC ────→│ 用 GPU 2,3 的 context│
+│                      │   handle     │ 打开 GPU 0 的内存    │
+│                      │              │                      │
+│                      │              │ ❌ zeMemOpenIpcHandle │
+│                      │              │    无法映射到本地设备  │
+│                      │              │    → hang / 错误      │
+└──────────────────────┘              └──────────────────────┘
+```
+
+`zeMemOpenIpcHandle()` 要求接收端的 context 能够访问 IPC handle 对应的物理设备。由于 Rank 2 的 Level Zero 运行时根本**看不到** GPU 0（被 `ZE_AFFINITY_MASK` 过滤掉了），这个调用无法完成，导致 hang。
+
+#### 17.2.4 为什么模式 A 和模式 C 不 hang
+
+| 模式 | 设备可见性 | contexts[0] 关联的物理设备 | IPC 能否跨 rank 打开 |
+|------|-----------|--------------------------|---------------------|
+| A（不设 mask） | 全部 4 GPU | GPU 0,1,2,3 | ✅ 所有 rank 的 context 都能访问所有 GPU |
+| B（分组 mask） | Rank 0,1→GPU 0,1；Rank 2,3→GPU 2,3 | 不同组不同 | ❌ 跨组 context 无法访问对方设备 |
+| C（统一 mask） | 全部 4 GPU | GPU 0,1,2,3 | ✅ 等同于不设 mask |
+
+### 17.3 oneCCL 源码中的相关警告
+
+oneCCL 的拓扑管理器已经意识到 narrow affinity mask 可能导致问题，但仅输出警告而非报错：
+
+```cpp
+// src/topology/topo_manager.cpp, 第 316-342 行
+char* affinity_mask_env = getenv("ZE_AFFINITY_MASK");
+
+if (!is_sub_vector(node_dev_uuids, comm_dev_uuids)) {
+    LOG_WARN("comm_dev_uuids is not sub-vector of node_dev_uuids"
+             ", this may happen due to narrow device affinity mask (",
+             ((affinity_mask_env) ? affinity_mask_env : "default"), ")");
+}
+```
+
+代码注释标注了 `TODO: make these checks mandatory`（第 318 行），说明开发者知道这是潜在问题，但尚未将其变为强制检查。
+
+### 17.4 IPC Handle 交换的三种模式
+
+oneCCL 支持三种 IPC 交换模式，但它们都受到跨 affinity mask 问题的影响：
+
+```cpp
+// src/common/global/ze/ze_fd_manager.hpp, 第 29-36 行
+enum class ipc_exchange_mode : int {
+    sockets,  // Unix domain sockets 交换 IPC handle
+    drmfd,    // DRM file descriptor 转换
+    pidfd,    // pidfd_open + pidfd_getfd
+    none
+};
+```
+
+- **sockets 模式**：直接交换 `ze_ipc_mem_handle_t`，接收端调用 `zeMemOpenIpcHandle`，同样需要正确的 context
+- **drmfd 模式**：转换为 DRM GEM handle，但最终仍通过 `zeMemOpenIpcHandle` 打开，context 问题不变
+- **pidfd 模式**：通过 `pidfd_open` + `pidfd_getfd` 复制文件描述符，但 `zeMemOpenIpcHandle` 的 context 约束依然存在
+
+### 17.5 对 vLLM DP>1 场景的影响
+
+这个问题直接影响 vLLM 中使用 `DP>1`（数据并行）+ TP（张量并行）的场景：
+
+```
+vLLM DP=2, TP=2 配置（4 GPU）：
+┌─────────────────────────────────────────┐
+│ DP Group 0 (ZE_AFFINITY_MASK="0,1")    │
+│   Rank 0 → GPU 0  ─┐                   │
+│   Rank 1 → GPU 1  ─┘ TP 组内通信 ✅    │
+├─────────────────────────────────────────┤
+│ DP Group 1 (ZE_AFFINITY_MASK="2,3")    │
+│   Rank 2 → GPU 2  ─┐                   │
+│   Rank 3 → GPU 3  ─┘ TP 组内通信 ✅    │
+├─────────────────────────────────────────┤
+│ DP 跨组通信（Rank 0 ↔ Rank 2）         │
+│   ❌ IPC handle 无法跨 affinity mask    │
+│   → all_reduce hang                     │
+└─────────────────────────────────────────┘
+```
+
+TP 组内通信（同一 `ZE_AFFINITY_MASK` 内的 rank）正常工作，因为它们共享相同的设备可见性。但 DP 跨组通信需要跨越不同的 `ZE_AFFINITY_MASK` 边界，触发上述 IPC 问题。
+
+### 17.6 可能的解决方向
+
+1. **不设置 ZE_AFFINITY_MASK**：使用 `CUDA_VISIBLE_DEVICES` 或 `ONEAPI_DEVICE_SELECTOR` 的等效机制来实现设备隔离，而非 `ZE_AFFINITY_MASK`
+2. **oneCCL 改进**：在 IPC handle 交换时检测跨 affinity mask 场景，自动回退到非 IPC 路径（如通过 host 内存中转）
+3. **应用层规避**：确保属于同一通信组的所有 rank 使用相同的 `ZE_AFFINITY_MASK`
+4. **Level Zero 运行时改进**：支持跨 affinity mask 的 IPC handle 打开（需要驱动层面支持）
+
+---
+
 *本报告基于 oneCCL 2021.17.2 版本源代码分析完成。*
